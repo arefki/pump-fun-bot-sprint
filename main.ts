@@ -1,75 +1,75 @@
-// Pump.fun Bot Sprint: Make Bot And Win — entry bot.
+// Pump.fun Bot Sprint entry — "completion chase".
 //
-// Strategy: early-momentum sniper on fresh bonding curves, sized by the
-// harness's own reserve cap, with a ladder exit and a hard stop.
+// A Solana paper-trading bot for pump.fun bonding curves (agent-fun/replay/v2).
+// It watches every coin's real SOL reserve and buys the ones that rocket to
+// 40 SOL of real reserve within 500 slots of creation, then holds for a 2x
+// or cuts at -30%. One full-size entry, no scale-in, no ladder.
 //
-// The dev window (24h, 1,222 mints) shows the shape of this market: a coin
-// that runs does it FAST (median 155 slots from creation to peak for coins
-// that 2x), and almost nothing holds its gains (only 3.9% of coins end the
-// window 1.5x above their first-trade price). So the bot enters early on
-// confirmed buy flow, takes profit on the spike, and never overstays.
+// Why this shape (all calibrated on the dev window, 1,222 coins, Nov 2-3):
+// - The bonding curve is constant-product (vq*vt = 3.219e25, verified): price
+//   is ((30+R)/30)^2 of creation at real reserve R, so completion at R=85 is
+//   ~14.7x creation and an R=40 entry (5.4x) has 2.7x of headroom left.
+// - Early-momentum entries (buy 2 SOL of flow in 100 slots) LOSE: the median
+//   coin is at 0.75x of its trigger price 900 slots later, and every
+//   early-entry / dip-buy / no-take-profit variant simulated negative
+//   (-0.08 to -0.19 per trade after fees and 2-slot fill latency).
+// - Late entries are the only ~breakeven family: R>=40, TP 2.0x, SL 0.7x is
+//   -0.015/trade unfiltered, and +0.10/trade when restricted to coins that
+//   reach R=40 within 500 slots of creation (n=33, win rate 39%). The fast
+//   risers carry the edge: 6 of the 7 tradeable completers in the window
+//   reached R=40 within 200 slots. Slow grinders (1000+ slots to R=40)
+//   never complete.
+// - The 2-slot fill latency plus ~2.6% round-trip fees is a ~10% tax on every
+//   trade, which is why tight stops and small take-profits all lose: the
+//   only winning shape is a wide stop (0.7x) with a big target (2.0x) on
+//   coins that have already proven explosive demand.
+// - 22 of 29 completers explode from trigger to graduation inside 2 slots
+//   and are untradeable (the buy is rejected once the curve completes), so
+//   the strategy does not depend on catching them — it depends on the
+//   tradeable risers that take minutes, not slots, to finish the run.
 //
-// Entry: within the first 100 slots after a coin's creation, once cumulative
-// buys reach 2 SOL across at least 3 buy trades. Forward calibration on the
-// dev window: 44.7% of such entries peak 1.5x or better, 25.0% peak 2x, and
-// only 15.7% hit -25% before +50%. The bot scales in toward a 0.3 SOL
-// target as the 1%-of-real-reserve buy cap opens up, while the price stays
-// within 25% of entry and within 300 slots of the first fill.
-//
-// Exits (checked every batch, all in cost-basis terms, bigint math):
-//   - take-profit 1: value >= 1.5x cost  -> sell half
-//   - take-profit 2: value >= 2.2x cost  -> sell all
-//   - trailing stop: after TP1, value falls to 70% of its peak ratio -> sell all
-//   - stop-loss:     value <= 0.75x cost -> sell all
-//   - time exit:     900 slots after the first fill with no exit yet -> sell all
-// Risk: at most 5 open positions (the harness cap), and entries halt if
-// marked equity draws down 20% from its peak. No shorts, no leverage.
-//
-// Determinism: every decision comes from the event stream alone. No clock,
-// no environment, no Math.random, no floats in any decision (all ratios are
-// compared by bigint cross-multiplication). Two runs on the same data
-// produce the same action log.
+// Risk: at most 5 open positions (harness cap); new entries halt if marked
+// equity draws down 20% from its peak; every ratio is compared with bigint
+// cross-multiplication (no floats); fully deterministic — every decision
+// comes from the event stream alone, so two runs match byte for byte.
 
-import {
-  runBot,
-  LAMPORTS_PER_SOL,
-  type Batch,
-  type BotState,
-  type OrderInput,
-} from "./vendor/makefun-bot.ts";
+import { runBot, type Batch, type BotState, type OrderInput } from "./vendor/makefun-bot.ts";
 
-const SOL = LAMPORTS_PER_SOL;
-
-// ---- entry ---------------------------------------------------------------
-const ENTRY_BUY_LAMPORTS = 2n * SOL; // cumulative buys that confirm flow
-const ENTRY_WINDOW_SLOTS = 100; // after creation
-const ENTRY_MIN_BUYS = 3; // distinct buy trades in the window
-const TARGET_LAMPORTS = 300_000_000n; // 0.3 SOL per position
+// ---- entry -----------------------------------------------------------------
+// Real reserve (lamports) a coin must reach to qualify.
+const RESERVE_ENTRY_LAMPORTS = 40_000_000_000n; // 40 SOL
+// The coin must reach that reserve within this many slots of its creation.
+const MAX_SLOTS_TO_RESERVE = 500;
+// After the first sighting at >= 40 SOL, the entry window stays open this long
+// (covers the case where all 5 position slots are briefly full).
+const ENTRY_WINDOW_SLOTS = 100;
+// One full-size entry per coin; the 1% cap at R=40 is 0.40 SOL, so 0.35 leaves
+// a buffer against a fill-time rejection if the reserve dips before the fill.
+const ENTRY_LAMPORTS = 350_000_000n; // 0.35 SOL
 const MIN_BUY_LAMPORTS = 20_000_000n; // 0.02 SOL: below this, skip the batch
-const SCALE_WINDOW_SLOTS = 300; // scale-in only this long after first fill
 const MAX_NEW_PER_BATCH = 3;
 
-// ---- exits ---------------------------------------------------------------
-const TIME_EXIT_SLOTS = 900; // ~6 minutes of slots
-const SLIPPAGE_BPS = 500;
+// ---- exits -----------------------------------------------------------------
+// Take-profit 2.0x cost / stop-loss 0.7x cost / time exit 20,000 slots
+// (~2.2 hours). No ladder, no trailing stop: the calibration says both cut
+// the winners that pay for the losers.
+const TIME_EXIT_SLOTS = 20_000;
+const BUY_SLIPPAGE_BPS = 1000;
+const SELL_SLIPPAGE_BPS = 10000; // on a crashing coin, a rejected sell is far
+// worse than a bad fill — each retry costs another 2 slots of decay.
 
-// ---- risk ----------------------------------------------------------------
+// ---- risk ------------------------------------------------------------------
 const DRAWDOWN_HALT_BPS = 2_000; // halt new entries at -20% equity
 const MAX_ORDERS_PER_BATCH = 12; // under the harness cap of 16
 
 interface Watch {
-  created: number;
-  buyVol: bigint;
-  buys: number;
-  entered: boolean;
+  created: number; // slot of the CreateEvent
+  r40slot: number; // first slot real reserve was seen >= 40 SOL (0 if never)
+  entered: boolean; // a buy fill arrived for this mint
 }
 
 interface Track {
-  entrySlot: number;
-  tp1: boolean;
-  // Peak value/cost ratio, as a rational peakNum / peakDen.
-  peakNum: bigint;
-  peakDen: bigint;
+  entrySlot: number; // slot of the first buy fill (time-exit clock)
 }
 
 const watch = new Map<string, Watch>();
@@ -93,15 +93,11 @@ function equity(state: BotState): bigint {
   return total;
 }
 
-/** SOL already committed to a mint: held cost plus pending buys. */
-function committed(state: BotState, mint: string): bigint {
-  let total = state.positions.get(mint)?.cost_lamports ?? 0n;
+function hasPendingBuy(state: BotState, mint: string): boolean {
   for (const p of state.pending.values()) {
-    if (p.order.side === "buy" && p.order.mint === mint) {
-      total += BigInt(p.order.quote_lamports);
-    }
+    if (p.order.side === "buy" && p.order.mint === mint) return true;
   }
-  return total;
+  return false;
 }
 
 function hasPendingSell(state: BotState, mint: string): boolean {
@@ -115,59 +111,46 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   const orders: OrderInput[] = [];
   const slot = state.slot;
 
-  // -- 1. folds fills: record first-fill slots for new positions -----------
+  // -- 1. fold fills: record first-fill slots for new positions -------------
   for (const fill of batch.fills) {
     if (fill.side === "buy" && fill.status === "filled") {
-      const t = track.get(fill.mint);
-      if (t === undefined) {
-        track.set(fill.mint, {
-          entrySlot: fill.slot,
-          tp1: false,
-          peakNum: 0n,
-          peakDen: 1n,
-        });
+      const w = watch.get(fill.mint);
+      if (w !== undefined) w.entered = true;
+      if (!track.has(fill.mint)) {
+        track.set(fill.mint, { entrySlot: fill.slot });
       }
     }
   }
 
-  // -- 2. fold events: watch new coins, confirm entry triggers -------------
-  const candidates: string[] = [];
+  // -- 2. fold events: record creations and reserve crossings ----------------
   for (const e of batch.events) {
     if (e.event === "CreateEvent") {
       if (!watch.has(e.mint)) {
-        watch.set(e.mint, { created: e.slot, buyVol: 0n, buys: 0, entered: false });
+        watch.set(e.mint, { created: e.slot, r40slot: 0, entered: false });
       }
     } else if (e.event === "TradeEvent") {
-      if (!e.is_buy) continue;
       const w = watch.get(e.mint);
-      if (w === undefined || w.entered) continue;
-      if (slot - w.created > ENTRY_WINDOW_SLOTS) continue;
-      w.buyVol += BigInt(e.sol_amount);
-      w.buys += 1;
-      if (w.buyVol >= ENTRY_BUY_LAMPORTS && w.buys >= ENTRY_MIN_BUYS) {
-        w.entered = true;
-        candidates.push(e.mint);
+      if (w === undefined) continue;
+      if (w.r40slot === 0 && e.real_quote_reserves >= RESERVE_ENTRY_LAMPORTS) {
+        w.r40slot = e.slot;
       }
-    } else {
-      // CompleteEvent: the curve migrated; the harness closes the position.
-      watch.delete(e.mint);
-      track.delete(e.mint);
+    }
+  }
+  // Coins without a CreateEvent in the stream (created before the window)
+  // are never watched: their age is unknown, so the fast-riser filter
+  // cannot verify them. Events arrive in chain order, so a coin's
+  // CreateEvent always precedes its trades.
+  if (watch.size > 8000) {
+    // Deterministic cap: drop the oldest entries (insertion order).
+    const drop = watch.size - 8000;
+    let n = 0;
+    for (const k of watch.keys()) {
+      if (n++ >= drop) break;
+      watch.delete(k);
     }
   }
 
-  // -- 3. sync trackers with the account ------------------------------------
-  for (const mint of [...track.keys()]) {
-    if (!state.positions.has(mint) && committed(state, mint) === 0n) {
-      track.delete(mint);
-    }
-  }
-  for (const mint of state.positions.keys()) {
-    if (!track.has(mint)) {
-      track.set(mint, { entrySlot: slot, tp1: false, peakNum: 0n, peakDen: 1n });
-    }
-  }
-
-  // -- 4. drawdown guard -----------------------------------------------------
+  // -- 3. drawdown guard -----------------------------------------------------
   const eq = equity(state);
   if (peakEquity === 0n) peakEquity = eq;
   if (eq > peakEquity) peakEquity = eq;
@@ -176,12 +159,13 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     console.error(`halt: equity drawdown over 20% at slot ${slot}`);
   }
 
-  // -- 5. exits, one decision per open position ------------------------------
+  // -- 4. exits: TP 2.0x / SL 0.7x / time 20,000 slots ------------------------
   for (const [mint, pos] of state.positions) {
     if (orders.length >= MAX_ORDERS_PER_BATCH) break;
     if (hasPendingSell(state, mint)) continue;
     const curve = state.curves.get(mint);
-    if (curve === undefined || curve.complete) continue;
+    if (curve === undefined || curve.complete) continue; // completed positions
+    // are force-closed by the harness at the completion value; nothing to do.
     const t = track.get(mint);
     if (t === undefined) continue;
     const tokens = pos.token_amount;
@@ -193,74 +177,49 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     const curNum = tokens * curve.virtual_quote_reserves;
     const curDen = curve.virtual_token_reserves * cost;
 
-    // Track the peak value/cost ratio for the trailing stop.
-    if (curNum * t.peakDen > t.peakNum * curDen) {
-      t.peakNum = curNum;
-      t.peakDen = curDen;
-    }
-
     const age = slot - t.entrySlot;
     let sell: bigint | null = null;
-    if (curNum * 4n <= curDen * 3n) {
-      sell = tokens; // stop-loss: value at or below 75% of cost
-    } else if (curNum * 5n >= curDen * 11n) {
-      sell = tokens; // take-profit 2: value at or above 2.2x cost
-    } else if (t.tp1 && curNum * t.peakDen * 10n <= t.peakNum * curDen * 7n) {
-      sell = tokens; // trailing stop: value fell to 70% of its peak ratio
-    } else if (!t.tp1 && curNum * 2n >= curDen * 3n) {
-      sell = tokens / 2n; // take-profit 1: value at or above 1.5x cost
-      t.tp1 = true;
+    if (curNum * 10n <= curDen * 7n) {
+      sell = tokens; // stop-loss: value at or below 70% of cost
+    } else if (curNum >= curDen * 2n) {
+      sell = tokens; // take-profit: value at or above 2x cost
     } else if (age > TIME_EXIT_SLOTS) {
-      sell = tokens; // time exit: no thesis left, free the slot
+      sell = tokens; // time exit: thesis expired
     }
     if (sell !== null && sell > 0n) {
-      orders.push({ side: "sell", mint, token_amount: sell, max_slippage_bps: SLIPPAGE_BPS });
+      orders.push({ side: "sell", mint, token_amount: sell, max_slippage_bps: SELL_SLIPPAGE_BPS });
     }
   }
 
-  // -- 6. entries and scale-ins ----------------------------------------------
+  // -- 5. entries: fast risers to 40 SOL of real reserve ----------------------
   if (!halted) {
     const maxPositions = state.hello.caps.max_open_positions;
     let opened = 0;
-    // 6a. fresh entries, in first-trigger order.
-    for (const mint of candidates) {
+    const stale: string[] = [];
+    for (const [mint, w] of watch) {
       if (orders.length >= MAX_ORDERS_PER_BATCH || opened >= MAX_NEW_PER_BATCH) break;
       if (state.committedPositionCount() >= maxPositions) break;
+      if (w.entered) continue;
+      if (w.r40slot === 0) {
+        // Too old to ever qualify: it can no longer reach R=40 within
+        // 500 slots of its creation.
+        if (slot - w.created > MAX_SLOTS_TO_RESERVE) stale.push(mint);
+        continue;
+      }
+      if (w.r40slot - w.created > MAX_SLOTS_TO_RESERVE) { stale.push(mint); continue; } // slow grinder
+      if (slot - w.r40slot > ENTRY_WINDOW_SLOTS) { stale.push(mint); continue; } // window closed
+      if (state.positions.has(mint) || hasPendingBuy(state, mint)) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) continue;
-      if (state.positions.has(mint)) continue;
+      if (curve.real_quote_reserves < RESERVE_ENTRY_LAMPORTS) continue; // dipped back
       const cap = state.maxBuyLamports(mint);
-      const size = cap < TARGET_LAMPORTS ? cap : TARGET_LAMPORTS;
+      const size = cap < ENTRY_LAMPORTS ? cap : ENTRY_LAMPORTS;
       if (size < MIN_BUY_LAMPORTS) continue;
       if (state.freeCashLamports() < size + state.txFeeLamports()) continue;
-      orders.push({ side: "buy", mint, quote_lamports: size, max_slippage_bps: SLIPPAGE_BPS });
+      orders.push({ side: "buy", mint, quote_lamports: size, max_slippage_bps: BUY_SLIPPAGE_BPS });
       opened += 1;
     }
-    // 6b. scale-ins toward the target while the entry stays fresh.
-    if (orders.length < MAX_ORDERS_PER_BATCH) {
-      for (const [mint, t] of track) {
-        if (orders.length >= MAX_ORDERS_PER_BATCH) break;
-        if (slot - t.entrySlot > SCALE_WINDOW_SLOTS) continue;
-        const curve = state.curves.get(mint);
-        if (curve === undefined || curve.complete) continue;
-        const have = committed(state, mint);
-        if (have >= TARGET_LAMPORTS) continue;
-        // Only add while the price is still near the entry (within +25%):
-        // never chase a spike with fresh size.
-        const pos = state.positions.get(mint);
-        if (pos === undefined || pos.cost_lamports === 0n) continue;
-        if (curve.virtual_token_reserves === 0n) continue;
-        const curNum = pos.token_amount * curve.virtual_quote_reserves;
-        const curDen = curve.virtual_token_reserves * pos.cost_lamports;
-        if (curNum * 4n > curDen * 5n) continue; // value above 1.25x cost
-        const cap = state.maxBuyLamports(mint);
-        const want = TARGET_LAMPORTS - have;
-        const size = cap < want ? cap : want;
-        if (size < MIN_BUY_LAMPORTS) continue;
-        if (state.freeCashLamports() < size + state.txFeeLamports()) continue;
-        orders.push({ side: "buy", mint, quote_lamports: size, max_slippage_bps: SLIPPAGE_BPS });
-      }
-    }
+    for (const mint of stale) watch.delete(mint);
   }
 
   return orders;
